@@ -845,6 +845,60 @@ vm_phys_alloc_npages(int domain, int pool, int npages, vm_page_t ma[])
 }
 
 /*
+ * Tries to allocate the specified number of contiguous pages
+ * from a specific physical address within a domain. Stops upon encountering an allocated page.
+ * Returns the actual number of allocated pages
+ * and a pointer to the first page in the allocated run.
+ *
+ * The free page queues for the specified domain must be locked.
+ */
+int
+vm_phys_alloc_contig_at(vm_page_t m_start, u_long npages, int domain, vm_page_t *m_ret)
+{
+	int i, rem, oind;
+	vm_page_t m, m_end;
+	struct vm_freelist *fl;
+	struct vm_phys_seg *seg;
+
+	KASSERT(npages > 0, ("npages is zero"));
+	KASSERT(domain >= 0 && domain < vm_ndomains, ("domain out of range"));
+	KASSERT(m_start != NULL, ("m_start is NULL"));
+	vm_domain_free_assert_locked(VM_DOMAIN(domain));
+	// TODO: sanity checks for npages and bounds check
+	m_end = m + npages;
+	*m_ret = NULL;
+
+	for(i = 0, m = m_start + 1; m < m_end; m++) {
+		if (m->domain != domain)
+			// TODO: use m->segind to skip to the appropriate segment
+			continue;
+		/* We've hit an allocated page - bail */
+		if(m->order == VM_NFREEORDER)
+			break;
+		oind = m->order;
+		/* Check whether this allocation overshoots */
+		if(m + (1 << order) >= m_end){
+			/* Round no remaining pages down to nearest order and split page */
+			rem = fls(m_end - m); // TODO: check correctness
+			vm_phys_split_pages(m, oind, fl, rem, 0);
+			oind = rem;
+		}
+		vm_freelist_rem(fl, m, oind);
+		if(order > 0)
+			m += (1 << order) - 1;
+
+		i++;
+	}
+
+	// XXX: necessary?
+	if(i != 0)
+		*m_ret = m_start + 1;
+
+	return (i);
+}
+
+
+/*
  * Allocate a contiguous, power of two-sized set of physical pages
  * from the free lists.
  *
@@ -1484,7 +1538,7 @@ vm_phys_find_queues_contig(
  */
 vm_page_t
 vm_phys_alloc_contig(int domain, u_long npages, vm_paddr_t low, vm_paddr_t high,
-    u_long alignment, vm_paddr_t boundary)
+    u_long alignment, vm_paddr_t boundary, u_long *nallocated)
 {
 	vm_paddr_t pa_end, pa_start;
 	struct vm_freelist *fl;

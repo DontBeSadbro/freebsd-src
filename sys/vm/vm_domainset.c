@@ -71,23 +71,24 @@ vm_domainset_iter_init(struct vm_domainset_iter *di, struct domainset *ds,
 	DOMAINSET_COPY(&ds->ds_mask, &di->di_valid_mask);
 	if (di->di_policy == DOMAINSET_POLICY_INTERLEAVE) {
 #if VM_NRESERVLEVEL > 0
-		if (vm_object_reserv(obj)) {
-			/*
-			 * Color the pindex so we end up on the correct
-			 * reservation boundary.
-			 */
-			pindex += obj->pg_color;
-			pindex >>= VM_LEVEL_0_ORDER;
-		} else
+    if (vm_object_reserv(obj)) {
+      /*
+       * Color the pindex so we end up on the correct
+       * reservation boundary.
+       */
+      pindex += obj->pg_color;
+      pindex >>= VM_LEVEL_0_ORDER;
+    } else
 #endif
-			pindex /= vm_domainset_default_stride;
-		/*
-		 * Offset pindex so the first page of each object does
-		 * not end up in domain 0.
-		 */
-		if (obj != NULL)
-			pindex += (((uintptr_t)obj) / sizeof(*obj));
-		di->di_offset = pindex;
+      pindex /= vm_domainset_default_stride;
+    /*
+     * Offset pindex so the first page of each object does
+     * not end up in domain 0.
+     */
+    if (obj != NULL)
+      pindex += (((uintptr_t)obj) / sizeof(*obj));
+    di->di_offset = pindex;
+
 	}
 	/* Skip domains below min on the first pass. */
 	di->di_minskip = true;
@@ -330,6 +331,136 @@ vm_domainset_iter_ignore(struct vm_domainset_iter *di, int domain)
 	    ("%s: domain %d not present in di_valid_mask for di %p",
 	    __func__, domain, di));
 	DOMAINSET_CLR(domain, &di->di_valid_mask);
+}
+
+static void
+vm_domainset_batch_iter_npages_interleave(struct vm_domainset_batch_iter *dbi, struct vm_object* obj, vm_pindex_t pindex, int *npages){
+  vm_pindex_t mask;
+
+#if VM_NRESERVLEVEL > 0
+  mask =  ((1 << VM_LEVEL_0_ORDER) - 1);
+  if(obj != NULL)
+    pindex += obj->pg_color;
+#else
+  mask = vm_domainset_default_stride - 1;
+#endif
+
+  *npages = (mask + 1) - (pindex & mask);
+}
+
+static void
+vm_domainset_batch_iter_npages_next(struct vm_domainset_batch_iter *dbi, int *npages)
+{
+  struct vm_domainset_iter *di = &dbi->di;
+
+	switch (di->di_policy) {
+  case DOMAINSET_POLICY_INTERLEAVE:
+#if VM_NRESERVLEVEL > 0
+    *npages = 1 << VM_LEVEL_0_ORDER;
+#else
+    *npages = vm_domainset_default_stride;
+#endif
+    break;
+  case DOMAINSET_POLICY_FIRSTTOUCH:
+    /* FALLTHROUGH */
+  case DOMAINSET_POLICY_ROUNDROBIN:
+    *npages = dbi->dbi_npages / vm_ndomains;
+		break;
+  case DOMAINSET_POLICY_PREFER:
+    *npages = dbi->dbi_npages;
+		break;
+	default:
+		panic("%s: Unknown policy %d", __func__,
+          di->di_policy);
+	}
+}
+
+static void
+vm_domainset_batch_iter_npages_first(struct vm_domainset_batch_iter *dbi, struct vm_object* obj,  vm_pindex_t pindex, int *npages)
+{
+  struct vm_domainset_iter *di = &dbi->di;
+
+	switch (di->di_policy) {
+	case DOMAINSET_POLICY_FIRSTTOUCH:
+    /* FALLTHROUGH */
+	case DOMAINSET_POLICY_PREFER:
+    *npages = dbi->dbi_npages;
+			break;
+	case DOMAINSET_POLICY_ROUNDROBIN:
+    *npages = dbi->dbi_npages / vm_ndomains;
+		break;
+	case DOMAINSET_POLICY_INTERLEAVE:
+    vm_domainset_batch_iter_npages_interleave(dbi, obj, pindex, npages);
+		break;
+	default:
+		panic("%s: Unknown policy %d", __func__,
+		    di->di_policy);
+	}
+}
+
+static void
+vm_domainset_batch_iter_next(struct vm_domainset_batch_iter *dbi,
+                                  int *domain, int *npages)
+{
+  vm_domainset_iter_next(&dbi->di, domain);
+  vm_domainset_batch_iter_npages_next(dbi, npages);
+}
+
+static void
+vm_domainset_batch_iter_first(struct vm_domainset_batch_iter *dbi, vm_object_t obj, vm_pindex_t pindex, int *domain, int *npages)
+{
+  vm_domainset_iter_first(&dbi->di, domain);
+  vm_domainset_batch_iter_npages_first(dbi, obj, pindex, npages);
+}
+
+
+void
+vm_domainset_batch_iter_page_init(struct vm_domainset_batch_iter *dbi, struct vm_object *obj,
+                                  vm_pindex_t pindex, int req_npages, int *domain, int *npages, int *req)
+{
+  vm_domainset_iter_page_init(&dbi->di, obj, pindex, domain, req);
+  dbi->dbi_npages = req_npages;
+
+  vm_domainset_batch_iter_npages_first(dbi, obj, pindex, npages);
+}
+
+int
+vm_domainset_batch_iter_page(struct vm_domainset_batch_iter *dbi, struct vm_object *obj,
+                             vm_pindex_t pindex, int *domain, int *npages)
+{
+        struct vm_domainset_iter *di = &dbi->di;
+
+        /* If there are more domains to visit we run the iterator. */
+        while (--di->di_n != 0) {
+          vm_domainset_batch_iter_next(dbi, domain, npages);
+                if (!di->di_minskip || !vm_page_count_min_domain(*domain))
+                        return (0);
+        }
+
+        /* If we skipped domains below min restart the search. */
+        if (di->di_minskip) {
+                di->di_minskip = false;
+                vm_domainset_batch_iter_first(dbi, obj, pindex, domain, npages);
+                return (0);
+        }
+
+        /* If we visited all domains and this was a NOWAIT we return error. */
+        if ((di->di_flags & (VM_ALLOC_WAITOK | VM_ALLOC_WAITFAIL)) == 0)
+                return (ENOMEM);
+
+        /* Wait for one of the domains to accumulate some free pages. */
+        if (obj != NULL)
+                VM_OBJECT_WUNLOCK(obj);
+        vm_wait_doms(&di->di_domain->ds_mask, 0);
+        if (obj != NULL)
+                VM_OBJECT_WLOCK(obj);
+        if ((di->di_flags & VM_ALLOC_WAITFAIL) != 0)
+                return (ENOMEM);
+
+        /* Restart the search. */
+        vm_domainset_batch_iter_first(dbi, obj, pindex, domain, npages);
+
+        return (0);
 }
 
 #else /* !NUMA */
