@@ -2006,7 +2006,7 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
         /* Allocate as much pages as possible from the reservation. */
         if (vm_object_reserv(object)){
                 while(got < npages){
-                        m = vm_reserv_alloc_page(object, pindex, domain, req, mpred);
+                        m = vm_reserv_alloc_npages(object, pindex, domain, req, ma);
                         if(m == NULL){
                                 break;
                         }
@@ -2048,161 +2048,9 @@ vm_page_alloc_pages(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int n
         int got = 0;
         vm_page_t m, mpred;
 
-        vm_domainset_batch_iter_page_init(&dbi, object, pindex, npages, &domain, &batch_npages, &req);
-        do {
-                mpred = vm_radix_lookup_le(&object->rtree, pindex + got);
-                /* Initialize mpred so reservation allocs go through */
-                if(mpred != NULL && mpred->object == NULL){
-                        m = mpred;
-                        mpred = vm_radix_lookup_le(&object->rtree, pindex + got-1);
-                        vm_page_alloc_init_page(object, pindex + got, m, mpred, req);
-                }
-
-                if(got + batch_npages > npages){
-                        batch_npages = npages - got;
-                }
-                got += vm_page_alloc_pages_domain(object, pindex + got, &ma[got], batch_npages, req, domain, mpred);
-
-                if (got == npages)
-                        break;
-
-        } while (vm_domainset_batch_iter_page(&dbi, object, pindex + got, &domain, &batch_npages) == 0);
-
-        return got;
-}
-
-static int
-vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int npages, int req, int domain, vm_page_t mpred){
-        int got = 0, rv;
-        vm_page_t m;
-        struct vm_domain *vmd = VM_DOMAIN(domain);
-
-        printf("%s: domain %d\n", __func__, domain);
-        /* Allocate as much pages as possible from the reservation. */
-        if (vm_object_reserv(object)){
-                while(got < npages){
-                        m = vm_reserv_alloc_page(object, pindex, domain, req, mpred);
-                        if(m == NULL){
-                                break;
-                        }
-
-                        ma[got] = m;
-                        got++;
-                        pindex++;
-                        mpred = m;
-                }
-                printf("%s: got %d pages using vm_reserv_alloc_page\n", __func__, got);
-        }
-
-        // TODO: select appropriate pool
-        if(got < npages){
-          vm_domain_free_lock(vmd);
-          rv = vm_phys_alloc_npages(domain, 0, npages - got, &ma[got]);
-          vm_domain_free_unlock(vmd);
-          printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
-
-          got += rv;
-        }
-        return got;
-}
-
-static void
-vm_page_alloc_init_page(vm_object_t object, vm_pindex_t pindex, vm_page_t m, vm_page_t mpred, int req){
-        int flags = 0;
-
-          vm_page_dequeue(m);
-          vm_page_alloc_check(m);
-
-          /*
-           * Initialize the page.  Only the PG_ZERO flag is inherited.
-           */
-          flags |= m->flags & PG_ZERO;
-          if ((req & VM_ALLOC_NODUMP) != 0)
-            flags |= PG_NODUMP;
-          m->flags = flags;
-          m->a.flags = 0;
-          m->oflags = (object->flags & OBJ_UNMANAGED) != 0 ? VPO_UNMANAGED : 0;
-          if ((req & (VM_ALLOC_NOBUSY | VM_ALLOC_SBUSY)) == 0)
-            m->busy_lock = VPB_CURTHREAD_EXCLUSIVE;
-          else if ((req & VM_ALLOC_SBUSY) != 0)
-            m->busy_lock = VPB_SHARERS_WORD(1);
-          else
-            m->busy_lock = VPB_UNBUSIED;
-          if (req & VM_ALLOC_WIRED) {
-            vm_wire_add(1);
-            m->ref_count = 1;
-          }
-          m->a.act_count = 0;
-
-          if (vm_page_insert_after(m, object, pindex, mpred)) {
-            if (req & VM_ALLOC_WIRED) {
-              vm_wire_sub(1);
-              m->ref_count = 0;
-            }
-            KASSERT(m->object == NULL, ("page %p has object", m));
-            m->oflags = VPO_UNMANAGED;
-            m->busy_lock = VPB_UNBUSIED;
-            /* Don't change PG_ZERO. */
-            vm_page_free_toq(m);
-            if (req & VM_ALLOC_WAITFAIL) {
-              VM_OBJECT_WUNLOCK(object);
-              vm_radix_wait();
-              VM_OBJECT_WLOCK(object);
-            }
-          }
-}
-
-static int
-vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int npages, int req, int domain, vm_page_t mpred){
-        int got = 0, rv;
-        vm_page_t m;
-        struct vm_domain *vmd = VM_DOMAIN(domain);
-
-        printf("%s: domain %d\n", __func__, domain);
-        /* Allocate as much pages as possible from the reservation. */
-        if (vm_object_reserv(object)){
-                while(got < npages){
-                        m = vm_reserv_alloc_page(object, pindex, domain, req, mpred);
-                        if(m == NULL){
-                                break;
-                        }
-
-                        vm_page_alloc_init_page(object, pindex, m, mpred, req);
-
-                        ma[got] = m;
-                        got++;
-                        pindex++;
-                        mpred = m;
-                }
-                printf("%s: got %d pages using vm_reserv_alloc_page\n", __func__, got);
-        }
-
-        // TODO: select appropriate pool
-        if(got < npages){
-          vm_domain_free_lock(vmd);
-          rv = vm_phys_alloc_npages(domain, 0, npages - got, &ma[got]);
-          vm_domain_free_unlock(vmd);
-          printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
-
-          got += rv;
-
-          mpred = vm_radix_lookup_le(&object->rtree, pindex);
-          for(int i=0; i<got; i++){
-                  m = ma[i];
-                  vm_page_alloc_init_page(object, pindex + i, m, mpred, req);
-                  mpred = m;
-          }
-        }
-        return got;
-}
-
-int
-vm_page_alloc_pages(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int npages, int req){
-        struct vm_domainset_batch_iter dbi;
-
-        int domain, batch_npages;
-        int got = 0;
-        vm_page_t m, mpred;
+        /* Clip 'npages' to object size */
+        if (pindex + npages > obj->size)
+                npages = obj->size - pindex;
 
         vm_domainset_batch_iter_page_init(&dbi, object, pindex, npages, &domain, &batch_npages, &req);
         do {

@@ -754,6 +754,81 @@ out:
 }
 
 /*
+ * Allocates a contiguous set of physical pages of the given size "npages"
+ * from existing or newly created reservations.  All of the physical pages
+ * must be at or above the given physical address "low" and below the given
+ * physical address "high".  The given value "alignment" determines the
+ * alignment of the first physical page in the set.  If the given value
+ * "boundary" is non-zero, then the set of physical pages cannot cross any
+ * physical address boundary that is a multiple of that value.  Both
+ * "alignment" and "boundary" must be a power of two.
+ *
+ * The page "mpred" must immediately precede the offset "pindex" within the
+ * specified object.
+ *
+ * The object must be locked.
+ */
+vm_page_t
+vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain,
+                       int req, u_long npages, vm_page_t *ma)
+{
+	struct vm_domain *vmd;
+	vm_paddr_t pa, size;
+	vm_page_t m, m_ret, msucc;
+	vm_pindex_t first, leftcap, rightcap;
+	vm_reserv_t rv;
+	u_long allocpages, maxpages, minpages;
+	int i, index, n;
+
+	VM_OBJECT_ASSERT_WLOCKED(object);
+	KASSERT(npages != 0, ("vm_reserv_alloc_contig: npages is 0"));
+
+	if (pindex < VM_RESERV_INDEX(object, pindex))
+          return (0);
+  /* Clip 'npages' to object size */
+  if (pindex + npages > object->size)
+          npages = obj->size - pindex;
+
+	/*
+	 * Look for an existing reservation.
+	 */
+	rv = vm_reserv_from_object(object, pindex, mpred, &msucc);
+	if (rv == NULL)
+          return (0);
+
+		KASSERT(object != kernel_object || rv->domain == domain,
+		    ("vm_reserv_alloc_contig: domain mismatch"));
+		index = VM_RESERV_INDEX(object, pindex);
+		domain = rv->domain;
+		vmd = VM_DOMAIN(domain);
+		vm_reserv_lock(rv);
+		/* Handle reclaim race. */
+		if (rv->object != object)
+			goto out;
+    /* Does the allocation fit within the reservation? */
+		if (rv->popcnt + npages > VM_LEVEL_0_NPAGES)
+            /* Clip 'npages' */
+            npages = VM_LEVEL_0_NPAGES - rv->popcnt;
+
+		m = &rv->pages[index];
+    if (!vm_domain_allocate(vmd, req, npages))
+            goto out;
+    nallocd = vm_phys_alloc_from(m, RV_END_PAGE, npages, ma, domain);
+    if(nallocd != npages)
+            vm_domain_freecnt_inc(vmd, npages - nallocd);
+
+		for (i = 0; i < nallocd; i++)
+			vm_reserv_populate(rv, index + i);
+		vm_reserv_unlock(rv);
+		return (nallocd);
+out:
+		vm_reserv_unlock(rv);
+		return (0);
+	}
+}
+
+
+/*
  * Allocate a physical page from an existing or newly created reservation.
  *
  * The page "mpred" must immediately precede the offset "pindex" within the

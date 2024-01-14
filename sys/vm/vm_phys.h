@@ -61,6 +61,7 @@ extern int *mem_locality;
 void vm_phys_add_seg(vm_paddr_t start, vm_paddr_t end);
 vm_page_t vm_phys_alloc_contig(int domain, u_long npages, vm_paddr_t low,
     vm_paddr_t high, u_long alignment, vm_paddr_t boundary);
+int vm_phys_alloc_contig_at(vm_page_t m_start, u_long npages, int domain, vm_page_t *m_ret);
 vm_page_t vm_phys_alloc_freelist_pages(int domain, int freelist, int pool,
     int order);
 int vm_phys_alloc_npages(int domain, int pool, int npages, vm_page_t ma[]);
