@@ -87,7 +87,8 @@ void vm_phys_early_startup(void);
 int vm_phys_avail_largest(void);
 vm_paddr_t vm_phys_avail_size(int i);
 bool vm_phys_is_dumpable(vm_paddr_t pa);
-
+int vm_phys_fragmentation_index(int order, int domain);
+void vm_phys_search_index_startup(vm_offset_t *vaddr);
 static inline int
 vm_phys_domain(vm_paddr_t pa)
 {

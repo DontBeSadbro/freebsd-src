@@ -38,15 +38,17 @@
  * virtual memory system.
  */
 
-#include <sys/cdefs.h>
 #include "opt_ddb.h"
 #include "opt_vm.h"
 
+#include <sys/cdefs.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/domainset.h>
-#include <sys/lock.h>
+#include <sys/eventhandler.h>
 #include <sys/kernel.h>
+#include <sys/kthread.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
@@ -57,16 +59,16 @@
 #include <sys/tree.h>
 #include <sys/vmmeter.h>
 
-#include <ddb/ddb.h>
-
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
-#include <vm/vm_param.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
-#include <vm/vm_phys.h>
 #include <vm/vm_pagequeue.h>
+#include <vm/vm_param.h>
+#include <vm/vm_phys.h>
+
+#include <ddb/ddb.h>
 
 _Static_assert(sizeof(long) * NBBY >= VM_PHYSSEG_MAX,
     "Too many physsegs.");
@@ -138,6 +140,67 @@ vm_paddr_t phys_avail[PHYS_AVAIL_COUNT];
 vm_paddr_t dump_avail[PHYS_AVAIL_COUNT];
 
 /*
+ * Structures used for memory compaction.
+ */
+
+/* Tracks invalid physical memory ranges. */
+struct vm_phys_hole {
+	vm_paddr_t start;
+	vm_paddr_t end;
+	int domain;
+};
+
+/* Used to track valid memory ranges inside search index chunks containing
+ * memory holes. */
+struct vm_phys_subseg {
+	vm_paddr_t start;
+	vm_paddr_t end;
+	SLIST_ENTRY(vm_phys_subseg) link;
+};
+SLIST_HEAD(vm_phys_subseg_head, vm_phys_subseg);
+
+/* Maximum number of memory regions enqueued during a search function run. */
+#define VM_PHYS_COMPACT_MAX_SEARCH_REGIONS 10
+
+/* Tracks various metrics and valid memory segments for a fixed-size physical
+ * memory region. */
+struct vm_phys_search_chunk {
+	int holecnt;
+	int score;
+	int skipidx;
+	struct vm_phys_subseg_head *shp;
+};
+
+struct vm_phys_search_index {
+	struct vm_phys_search_chunk *chunks;
+	int nchunks;
+	vm_paddr_t dom_start;
+	vm_paddr_t dom_end;
+};
+
+struct vm_phys_compact_ctx {
+	struct thread *kthr;
+	int last_idx; /* saved index of last chunk visited by the search fn */
+	int region_idx[VM_PHYS_COMPACT_MAX_SEARCH_REGIONS]; /* indicies of
+							       candidate regions
+							       to compact */
+	int regions_queued;
+	struct vm_phys_search_index *sip; /* pointer to domain search index */
+};
+
+static void vm_phys_update_search_index(vm_page_t m, int order, bool alloc);
+
+static struct vm_phys_search_index vm_phys_search_index[MAXMEMDOM];
+
+static struct vm_phys_hole vm_phys_holes[VM_PHYSSEG_MAX * 2];
+static int vm_phys_nholes;
+
+struct vm_phys_info {
+	uint64_t free_pages;
+	uint64_t free_blocks;
+};
+
+/*
  * Provides the mapping from VM_FREELIST_* to free list indices (flind).
  */
 static int __read_mostly vm_freelist_to_flind[VM_NFREELIST];
@@ -161,6 +224,11 @@ SYSCTL_OID(_vm, OID_AUTO, phys_free,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     sysctl_vm_phys_free, "A",
     "Phys Free Info");
+
+static int sysctl_vm_phys_frag_idx(SYSCTL_HANDLER_ARGS);
+SYSCTL_OID(_vm, OID_AUTO, phys_frag_idx,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_vm_phys_frag_idx, "A", "Phys Frag Info");
 
 static int sysctl_vm_phys_segs(SYSCTL_HANDLER_ARGS);
 SYSCTL_OID(_vm, OID_AUTO, phys_segs,
@@ -297,6 +365,80 @@ sysctl_vm_phys_free(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+static void
+vm_phys_get_info(struct vm_phys_info *info, int domain)
+{
+	struct vm_freelist *fl;
+	int pind, oind, flind;
+
+	/* Calculate total number of free pages and blocks */
+	info->free_pages = info->free_blocks = 0;
+	for (flind = 0; flind < vm_nfreelists; flind++) {
+		for (oind = VM_NFREEORDER - 1; oind >= 0; oind--) {
+			for (pind = 0; pind < VM_NFREEPOOL; pind++) {
+				fl = vm_phys_free_queues[domain][flind][pind];
+				info->free_pages += fl[oind].lcnt << oind;
+				info->free_blocks += fl[oind].lcnt;
+			}
+		}
+	}
+}
+
+int
+vm_phys_fragmentation_index(int order, int domain)
+{
+	struct vm_phys_info info;
+
+	vm_domain_free_assert_locked(VM_DOMAIN(domain));
+	vm_phys_get_info(&info, domain);
+
+	if (info.free_blocks == 0) {
+		return (0);
+	}
+
+	return (1000 -
+	    ((info.free_pages * 1000) / (1 << order) / info.free_blocks));
+}
+
+/*
+ * Outputs the value of the Free Memory Fragmentation Index (FMFI) for each
+ * domain.
+ */
+static int
+sysctl_vm_phys_frag_idx(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbuf;
+	int64_t idx;
+	int oind, dom, error;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sbuf, NULL, 128 * vm_ndomains, req);
+
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		vm_domain_free_lock(VM_DOMAIN(dom));
+
+		sbuf_printf(&sbuf, "\n--\n");
+		sbuf_printf(&sbuf, "\nDOMAIN %d\n", dom);
+		sbuf_printf(&sbuf, "\n  ORDER (SIZE) |  FMFI\n");
+		sbuf_printf(&sbuf, "--\n");
+
+		for (oind = VM_NFREEORDER - 1; oind >= 0; oind--) {
+			idx = vm_phys_fragmentation_index(oind, dom);
+			sbuf_printf(&sbuf, "  %2d (%6dK) ", oind,
+			    1 << (PAGE_SHIFT - 10 + oind));
+			sbuf_printf(&sbuf, "|  %ld \n", idx);
+		}
+
+		vm_domain_free_unlock(VM_DOMAIN(dom));
+	}
+
+	error = sbuf_finish(&sbuf);
+	sbuf_delete(&sbuf);
+	return (error);
+}
+
 /*
  * Outputs the set of physical memory segments.
  */
@@ -384,6 +526,7 @@ vm_freelist_add(struct vm_freelist *fl, vm_page_t m, int order, int tail)
 	else
 		TAILQ_INSERT_HEAD(&fl[order].pl, m, listq);
 	fl[order].lcnt++;
+	vm_phys_update_search_index(m, order, false);
 }
 
 static void
@@ -393,6 +536,7 @@ vm_freelist_rem(struct vm_freelist *fl, vm_page_t m, int order)
 	TAILQ_REMOVE(&fl[order].pl, m, listq);
 	fl[order].lcnt--;
 	m->order = VM_NFREEORDER;
+	vm_phys_update_search_index(m, order, true);
 }
 
 /*
@@ -618,6 +762,58 @@ vm_phys_init(void)
 					TAILQ_INIT(&fl[oind].pl);
 			}
 		}
+	}
+
+	/*
+	 * Initialize hole array.
+	 */
+	struct vm_phys_hole *hp;
+
+	vm_phys_nholes = 0;
+	if (vm_phys_segs[0].start != 0) {
+		hp = &vm_phys_holes[0];
+		hp->start = 0;
+		hp->end = vm_phys_segs[0].start;
+		hp->domain = vm_phys_segs[0].domain;
+		vm_phys_nholes++;
+	}
+
+	struct vm_phys_search_index *sip;
+	/* Initialize memory hole array. */
+	for (int i = 0; i + 1 <= vm_phys_nsegs; i++, vm_phys_nholes++) {
+		hp = &vm_phys_holes[vm_phys_nholes];
+		hp->start = vm_phys_segs[i].end;
+		hp->end = vm_phys_segs[i + 1].start;
+		hp->domain = vm_phys_segs[i].domain;
+		sip = &vm_phys_search_index[hp->domain];
+
+		/* Does this hole span two domains? */
+		if (vm_phys_segs[i].domain != vm_phys_segs[i + 1].domain &&
+		    hp->end > sip->dom_end) {
+			/* Clamp end of current hole to domain end */
+			sip = &vm_phys_search_index[hp->domain];
+			hp->end = sip->dom_end;
+			/* Add new hole at beginning of subsequent domain */
+			vm_phys_nholes++;
+			hp = &vm_phys_holes[vm_phys_nholes];
+			hp->domain = vm_phys_segs[i + 1].domain;
+			sip = &vm_phys_search_index[hp->domain];
+			/* Hole starts at domain start and ends at the start of
+			 * the first segment. */
+			hp->start = sip->dom_start;
+			hp->end = vm_phys_segs[i + 1].start;
+		}
+	}
+
+	/* Register hole at end of last domain */
+	struct vm_phys_seg *segp = &vm_phys_segs[vm_phys_nsegs];
+	sip = &vm_phys_search_index[segp->domain];
+	if (segp->end < sip->dom_end) {
+		hp = &vm_phys_holes[vm_phys_nholes];
+		hp->start = segp->end;
+		hp->end = sip->dom_end;
+		hp->domain = segp->domain;
+		vm_phys_nholes++;
 	}
 
 	rw_init(&vm_phys_fictitious_reg_lock, "vmfctr");
@@ -1860,3 +2056,688 @@ DB_SHOW_COMMAND_FLAGS(freepages, db_show_freepages, DB_CMD_MEMSAFE)
 	}
 }
 #endif
+
+#define VM_PHYS_SEARCH_CHUNK_ORDER (15)
+#define VM_PHYS_SEARCH_CHUNK_NPAGES (1 << (VM_PHYS_SEARCH_CHUNK_ORDER))
+#define VM_PHYS_SEARCH_CHUNK_SIZE \
+	(1 << (PAGE_SHIFT + VM_PHYS_SEARCH_CHUNK_ORDER))
+#define VM_PHYS_SEARCH_CHUNK_MASK (VM_PHYS_SEARCH_CHUNK_SIZE - 1)
+#define VM_PHYS_HOLECNT_HI ((1 << (VM_PHYS_SEARCH_CHUNK_ORDER)) - 100)
+#define VM_PHYS_HOLECNT_LO (1)
+
+static __inline vm_paddr_t
+vm_phys_search_idx_to_paddr(int idx, int domain)
+{
+	vm_paddr_t paddr;
+	struct vm_phys_search_index *sip = &vm_phys_search_index[domain];
+
+	paddr = (vm_paddr_t)idx << ((VM_PHYS_SEARCH_CHUNK_ORDER) + PAGE_SHIFT);
+	/* Adjust address relative to domain start */
+	paddr += sip->dom_start & ~VM_PHYS_SEARCH_CHUNK_MASK;
+
+	return (paddr);
+}
+
+static __inline int
+vm_phys_paddr_to_chunk_idx(vm_paddr_t paddr, int domain)
+{
+	struct vm_phys_search_index *sip = &vm_phys_search_index[domain];
+
+	/* Adjust address relative to domain start */
+	paddr -= sip->dom_start & ~VM_PHYS_SEARCH_CHUNK_MASK;
+	/* Strip lower bits */
+	paddr &= ~VM_PHYS_SEARCH_CHUNK_MASK;
+	return (int)(paddr >> ((VM_PHYS_SEARCH_CHUNK_ORDER) + PAGE_SHIFT));
+}
+
+static __inline struct vm_phys_search_chunk *
+vm_phys_search_get_chunk(struct vm_phys_search_index *sip, int idx)
+{
+	KASSERT(idx >= 0 && idx < sip->nchunks,
+	    ("%s: search index out-of-bounds access, idx: %d, dom_start: %p, dom_end: %p, nchunks: %d",
+		__func__, idx, (void *)sip->dom_start, (void *)sip->dom_end,
+		sip->nchunks));
+
+	return (&sip->chunks[idx]);
+}
+
+static struct vm_phys_search_chunk *
+vm_phys_paddr_to_search_chunk(vm_paddr_t paddr, int domain)
+{
+	struct vm_phys_search_index *sip = &vm_phys_search_index[domain];
+	int idx = vm_phys_paddr_to_chunk_idx(paddr, domain);
+
+	return vm_phys_search_get_chunk(sip, idx);
+}
+
+/*
+ * Allocates physical memory required for the memory compaction search index.
+ */
+void
+vm_phys_search_index_startup(vm_offset_t *vaddr)
+{
+	struct vm_phys_search_index *cur_idx;
+	vm_paddr_t pa;
+	vm_paddr_t dom_start, dom_end;
+	size_t alloc_size;
+	int dom_nsearch_chunks;
+	int i;
+
+	for (int dom = 0; dom < vm_ndomains; dom++) {
+		cur_idx = &vm_phys_search_index[dom];
+		dom_nsearch_chunks = 0;
+		/* Calculate number of of search index chunks for current domain
+		 */
+		if (mem_affinity != NULL) {
+			for (i = 0; mem_affinity[i].end != 0; i++) {
+				if (mem_affinity[i].domain == dom) {
+					dom_start = mem_affinity[i].start;
+					while (mem_affinity[i].domain == dom) {
+						i++;
+					}
+					dom_end = mem_affinity[i - 1].end;
+				}
+			}
+		} else {
+			dom_start = phys_avail[0];
+			i = 1;
+			while (phys_avail[i + 1] != 0) {
+				i++;
+			}
+			dom_end = phys_avail[i];
+		}
+		/* Allocate search index for current domain */
+		dom_nsearch_chunks = atop(dom_end - dom_start) /
+		    VM_PHYS_SEARCH_CHUNK_NPAGES;
+		/* Add additional chunks if beginning and start aren't search
+		 * chunk-aligned. */
+		if (dom_start & VM_PHYS_SEARCH_CHUNK_MASK)
+			dom_nsearch_chunks++;
+		if (dom_end & VM_PHYS_SEARCH_CHUNK_MASK)
+			dom_nsearch_chunks++;
+
+		alloc_size = round_page(
+		    dom_nsearch_chunks * sizeof(struct vm_phys_search_chunk));
+		pa = vm_phys_early_alloc(dom, alloc_size);
+
+		/* Map and zero the array */
+		cur_idx->chunks = (void *)(uintptr_t)pmap_map(vaddr, pa,
+		    pa + alloc_size, VM_PROT_READ | VM_PROT_WRITE);
+		cur_idx->nchunks = dom_nsearch_chunks;
+		cur_idx->dom_start = dom_start;
+		cur_idx->dom_end = dom_end;
+
+		if (cur_idx->chunks == NULL) {
+			panic("Unable to allocate search index for domain %d\n",
+			    dom);
+		}
+
+		bzero(cur_idx->chunks, alloc_size);
+	}
+}
+
+static void
+vm_phys_update_search_index(vm_page_t m, int order, bool alloc)
+{
+	int domain = vm_page_domain(m);
+	struct vm_phys_search_chunk *scp =
+	    vm_phys_paddr_to_search_chunk(m->phys_addr, domain);
+	int pgcnt = 1 << order;
+
+	/* Update chunk hole count */
+	scp->holecnt += alloc ? -pgcnt : pgcnt;
+	KASSERT(scp->holecnt >= 0 &&
+		scp->holecnt <= VM_PHYS_SEARCH_CHUNK_NPAGES,
+	    ("%s: inconsistent hole count: %d", __func__, scp->holecnt));
+
+	/* Update chunk fragmentation score */
+	if (order == 0) {
+		scp->score += alloc ? -1 : 1;
+		if (scp->score < 0) {
+			scp->score = 0;
+		}
+	}
+}
+
+static void
+vm_phys_chunk_register_hole(struct vm_phys_search_chunk *cp,
+    vm_paddr_t hole_start, vm_paddr_t hole_end)
+{
+	struct vm_phys_subseg *ssp;
+
+	if (cp->shp == NULL) {
+		vm_paddr_t chunk_start = hole_start &
+		    ~VM_PHYS_SEARCH_CHUNK_MASK;
+		cp->shp = malloc(sizeof(*cp->shp), M_TEMP, M_ZERO | M_WAITOK);
+		SLIST_INIT(cp->shp);
+		/* Split chunk into a subseg */
+		ssp = malloc(sizeof(*ssp), M_TEMP, M_ZERO | M_WAITOK);
+		ssp->start = chunk_start;
+		ssp->end = chunk_start + VM_PHYS_SEARCH_CHUNK_SIZE;
+
+		SLIST_INSERT_HEAD(cp->shp, ssp, link);
+	}
+
+	/*
+	 * Holes are ordered by paddr - hole registration will
+	 * thus always affect the first subsegment in the list.
+	 * Take last subseg and split it.
+	 */
+	ssp = SLIST_FIRST(cp->shp);
+
+	if (hole_start == ssp->start) {
+		ssp->start = hole_end;
+	} else if (hole_end == ssp->end) {
+		ssp->end = hole_start;
+	} else if (hole_start == ssp->end) {
+		/* Last hole in chunk */
+		return;
+	} else { /* Hole splits the subseg - create and enqueue new subseg */
+		struct vm_phys_subseg *nssp = malloc(sizeof(*nssp), M_TEMP,
+		    M_ZERO | M_WAITOK);
+
+		nssp->start = hole_end;
+		nssp->end = ssp->end;
+		printf(
+		    "%s: hole_start: %p, hole_end: %p, ssp start: %p, ssp end: %p\n",
+		    __func__, (void *)hole_start, (void *)hole_end,
+		    (void *)ssp->start, (void *)ssp->end);
+		ssp->end = hole_start;
+		KASSERT(nssp->end > nssp->start,
+		    ("%s: inconsistent subsegment after splitting", __func__));
+
+		SLIST_INSERT_HEAD(cp->shp, nssp, link);
+	}
+
+	KASSERT(ssp->end > ssp->start,
+	    ("%s: inconsistent subsegment", __func__));
+}
+
+/*
+ * Populates compaction search index with hole information.
+ */
+static void
+vm_phys_compact_init_holes(void)
+{
+	int dom;
+	struct vm_phys_search_index *sip;
+	struct vm_phys_search_chunk *start_chunk, *end_chunk;
+	struct vm_phys_hole *hp;
+	int start_idx, end_idx;
+
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		sip = &vm_phys_search_index[dom];
+
+		/* Add hole information to domain search chunks */
+		for (int i = 0; i < vm_phys_nholes; i++) {
+			hp = &vm_phys_holes[i];
+			if (hp->domain != dom)
+				continue;
+
+			start_idx = vm_phys_paddr_to_chunk_idx(hp->start, dom);
+			end_idx = vm_phys_paddr_to_chunk_idx(hp->end, dom);
+
+			start_chunk = vm_phys_search_get_chunk(sip, start_idx);
+			/*
+			 * If the domain end address is search chunk-aligned
+			 * and a hole ends there, decrement the index to avoid
+			 * an out of bounds access to the search index chunks.
+			 */
+			if ((sip->dom_end & VM_PHYS_SEARCH_CHUNK_MASK) == 0 &&
+			    hp->end == sip->dom_end) {
+				end_chunk = vm_phys_search_get_chunk(sip,
+				    end_idx - 1);
+			} else {
+				end_chunk = vm_phys_search_get_chunk(sip,
+				    end_idx);
+			}
+
+			/* Hole is completely inside this chunk */
+			if (start_chunk == end_chunk) {
+				/* Register hole in current chunk. */
+				vm_phys_chunk_register_hole(start_chunk,
+				    hp->start, hp->end);
+			} else { /* Hole spans multiple chunks */
+				if (hp->start & VM_PHYS_SEARCH_CHUNK_MASK) {
+					/* Partial overlap - register hole in
+					 * first chunk. */
+					vm_phys_chunk_register_hole(start_chunk,
+					    hp->start,
+					    (hp->start &
+						~VM_PHYS_SEARCH_CHUNK_MASK) +
+						VM_PHYS_SEARCH_CHUNK_SIZE);
+					start_chunk++;
+				}
+				/* Mark all chunks that are completely covered
+				 * by this hole as invalid. */
+				while (start_chunk < end_chunk) {
+					start_chunk->skipidx = end_idx;
+					start_chunk++;
+				}
+
+				if (hp->end & VM_PHYS_SEARCH_CHUNK_MASK) {
+					/* Partial overlap - register hole in
+					 * last chunk. */
+					vm_phys_chunk_register_hole(end_chunk,
+					    (hp->end &
+						~VM_PHYS_SEARCH_CHUNK_MASK),
+					    hp->end);
+				}
+			}
+		}
+		/* Register search index holes at domain end */
+		if (sip->dom_end & VM_PHYS_SEARCH_CHUNK_MASK) {
+			end_idx = vm_phys_paddr_to_chunk_idx(sip->dom_end, dom);
+			end_chunk = vm_phys_paddr_to_search_chunk(sip->dom_end,
+			    dom);
+
+			vm_phys_chunk_register_hole(end_chunk, sip->dom_end,
+			    vm_phys_search_idx_to_paddr(end_idx + 1, dom));
+		}
+	}
+}
+
+/* Initializes holes. */
+static void
+vm_phys_init_compact(void *arg)
+{
+	vm_phys_compact_init_holes();
+}
+
+SYSINIT(vm_phys_compact, SI_SUB_KMEM + 1, SI_ORDER_ANY, vm_phys_init_compact,
+    NULL);
+
+static void
+vm_phys_ctx_insert_chunk_sorted(struct vm_phys_compact_ctx *ctx,
+    struct vm_phys_search_index *sip, int idx)
+{
+	struct vm_phys_search_chunk *scp, *tmp;
+	int i;
+
+	scp = vm_phys_search_get_chunk(sip, idx);
+	if (ctx->regions_queued == VM_PHYS_COMPACT_MAX_SEARCH_REGIONS) {
+		/* Fetch last enqueued chunk */
+		tmp = vm_phys_search_get_chunk(sip,
+		    ctx->region_idx[VM_PHYS_COMPACT_MAX_SEARCH_REGIONS - 1]);
+		if (scp->score <= tmp->score) {
+			return;
+		}
+	} else if (ctx->regions_queued == 0) {
+		ctx->region_idx[0] = idx;
+		ctx->regions_queued++;
+		return;
+	}
+
+	for (i = 0; i < ctx->regions_queued; i++) {
+		tmp = vm_phys_search_get_chunk(sip, ctx->region_idx[i]);
+		if (scp->score > tmp->score) {
+			break;
+		}
+	}
+	if (i < ctx->regions_queued - 1) {
+		/* Shift every element from i onward to the right */
+		for (int j = ctx->regions_queued - 1; j > (i + 1); j--) {
+			ctx->region_idx[j] = ctx->region_idx[j - 1];
+		}
+	}
+	ctx->region_idx[i] = idx;
+
+	if (ctx->regions_queued < VM_PHYS_COMPACT_MAX_SEARCH_REGIONS) {
+		ctx->regions_queued++;
+	}
+}
+
+/*
+ * Scans the search index for physical memory regions that could be potential
+ * compaction candidates. Eligible regions are enqueued on a slist.
+ */
+static __noinline int
+vm_phys_compact_search(struct vm_phys_compact_ctx *ctx, int domain)
+{
+	int idx;
+	int chunks_scanned = 0;
+	struct vm_phys_search_chunk *scp;
+	struct vm_phys_search_index *sip = &vm_phys_search_index[domain];
+
+	/*
+	 * Scan search index until we do a full circle.
+	 */
+	ctx->regions_queued = 0;
+	/* Continue where we left off. */
+	idx = ctx->last_idx;
+	while (chunks_scanned < (sip->nchunks - 1)) {
+		for (; chunks_scanned < (sip->nchunks - 1) &&
+		     idx < sip->nchunks - 1;
+		     chunks_scanned++, idx++) {
+
+			scp = vm_phys_search_get_chunk(sip, idx);
+			/* Skip current chunk if it was marked as invalid */
+			if (scp->skipidx) {
+				idx = scp->skipidx - 1;
+				chunks_scanned += scp->skipidx - idx - 1;
+				continue;
+			}
+
+			/*
+			 * Determine whether the current chunk is
+			 * suitable for compaction.
+			 */
+			if (scp->score > 0) {
+				vm_phys_ctx_insert_chunk_sorted(ctx, sip, idx);
+			}
+		}
+		idx = (idx + 1) % (sip->nchunks - 1);
+	}
+
+	ctx->last_idx = (idx + 1) % (sip->nchunks - 1);
+
+	return ctx->regions_queued;
+}
+
+/*
+ * Determine whether a given page is eligible as a relocation destination.
+ */
+static __noinline bool
+vm_phys_compact_page_free(vm_page_t p)
+{
+	return (p->order != VM_NFREEORDER);
+}
+
+/*
+ * Determine whether a given page is eligible to be relocated.
+ * A suitable page is left in a xbusied state and its object is locked.
+ */
+static __noinline bool
+vm_phys_compact_page_relocatable(vm_page_t p)
+{
+	vm_object_t obj;
+
+	if (p->order != VM_NFREEORDER || vm_page_wired(p) ||
+	    (obj = atomic_load_ptr(&p->object)) == NULL)
+		return false;
+
+	VM_OBJECT_WLOCK(obj);
+	if (obj != p->object ||
+	    (obj->type != OBJT_DEFAULT && obj->type != OBJT_VNODE)) {
+		goto unlock;
+	}
+
+	if (vm_page_tryxbusy(p) == 0)
+		goto unlock;
+
+	if (!vm_page_wired(p) && !vm_page_none_valid(p)) {
+		return true;
+	}
+
+	vm_page_xunbusy(p);
+unlock:
+	VM_OBJECT_WUNLOCK(obj);
+	return false;
+}
+
+static size_t
+vm_phys_compact_region(vm_paddr_t start, vm_paddr_t end, int domain)
+{
+	size_t nrelocated = 0;
+	vm_page_t free, scan;
+	struct vm_domain *vmd = VM_DOMAIN(domain);
+	struct vm_freelist *fl;
+	int error, order;
+
+	free = PHYS_TO_VM_PAGE(start);
+	scan = PHYS_TO_VM_PAGE(end - PAGE_SIZE);
+
+	KASSERT(free && scan,
+	    ("%s: pages are null %p, %p, region start: %p, region end: %p",
+		__func__, free, scan, (void *)start, (void *)end));
+	KASSERT(free->phys_addr && scan->phys_addr,
+	    ("%s: pages have null paddr %p, %p", __func__,
+		(void *)free->phys_addr, (void *)scan->phys_addr));
+
+	while (free < scan) {
+
+		/* Find suitable destination page ("hole"). */
+		while (free < scan && !vm_phys_compact_page_free(free)) {
+			free++;
+		}
+
+		if (__predict_false(free >= scan)) {
+			break;
+		}
+
+		/* Find suitable relocation candidate. */
+		while (free < scan && !vm_phys_compact_page_relocatable(scan)) {
+			scan--;
+		}
+
+		if (__predict_false(free >= scan)) {
+			break;
+		}
+		vm_domain_free_lock(vmd);
+		/* Check if the dst page is still eligible and remove it from
+		 * the freelist. */
+		if (free->order == VM_NFREEORDER || !vm_page_none_valid(free)) {
+			error = 2;
+
+			VM_OBJECT_WUNLOCK(scan->object);
+			vm_page_xunbusy(scan);
+			vm_domain_free_unlock(vmd);
+			free++;
+			continue;
+		}
+		/* Split page to 0-order if necessary */
+		if (free->order != 0) {
+			fl = (*vm_phys_segs[free->segind]
+				   .free_queues)[free->pool];
+			order = free->order;
+			vm_freelist_rem(fl, free, order);
+			vm_phys_split_pages(free, order, fl, 0, 0);
+		}
+		vm_phys_unfree_page(free);
+
+		/* Swap the two pages and move "fingers". */
+		error = vm_page_relocate_page(scan, free, domain);
+		if (error == 0) {
+			nrelocated++;
+			scan--;
+			free++;
+		} else if (error == 1) {
+			scan--;
+		} else {
+			free++;
+		}
+	}
+
+	return nrelocated;
+}
+
+static __noinline size_t
+vm_phys_compact(struct vm_phys_compact_ctx *ctx, int domain)
+{
+	size_t nrelocated = 0;
+	int i, idx;
+	vm_paddr_t start, end;
+	struct vm_phys_search_chunk *scp;
+	struct vm_phys_subseg *ssp;
+
+	for (i = 0; i < ctx->regions_queued; i++) {
+		idx = ctx->region_idx[i];
+		scp = vm_phys_search_get_chunk(ctx->sip, idx);
+		if (scp->shp == NULL) {
+			start = vm_phys_search_idx_to_paddr(idx, domain);
+			end = vm_phys_search_idx_to_paddr(idx + 1, domain);
+			nrelocated += vm_phys_compact_region(start, end,
+			    domain);
+		} else {
+			SLIST_FOREACH (ssp, scp->shp, link) {
+				nrelocated += vm_phys_compact_region(ssp->start,
+				    ssp->end, domain);
+			}
+		}
+	}
+
+	return nrelocated;
+}
+
+/*
+ * Value of FMFI metric below which compaction will not start.
+ */
+static int vm_phys_compact_thresh = 300; /* 200 - 1000 */
+static int sysctl_vm_phys_compact_thresh(SYSCTL_HANDLER_ARGS);
+SYSCTL_OID(_vm, OID_AUTO, phys_compact_thresh, CTLTYPE_INT | CTLFLAG_RW, NULL,
+    0, sysctl_vm_phys_compact_thresh, "I",
+    "Fragmentation index threshold for memory compaction");
+
+static int
+sysctl_vm_phys_compact_thresh(SYSCTL_HANDLER_ARGS)
+{
+	int error;
+	int new = vm_phys_compact_thresh;
+
+	error = sysctl_handle_int(oidp, &new, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	if (new != vm_phys_compact_thresh) {
+		if (new < 200) {
+			new = 200;
+		} else if (new > 1000) {
+			new = 1000;
+		}
+		vm_phys_compact_thresh = new;
+	}
+
+	return (0);
+}
+
+/*
+ * Structures and routines used by the compaction daemon.
+ */
+static struct proc *compactproc;
+static struct vm_phys_compact_ctx compact_ctx[MAXMEMDOM - 1];
+
+static void
+vm_phys_compact_thread(void *arg)
+{
+	size_t domain = (size_t)arg;
+	struct vm_phys_compact_ctx *ctx = &compact_ctx[domain];
+	struct vm_domain *dom = VM_DOMAIN(domain);
+	int old_frag_idx, frag_idx, nretries = 0;
+	int nrelocated;
+	int timo = hz;
+
+	while (true) {
+		tsleep(ctx, PPAUSE | PCATCH | PNOLOCK, "cmpctslp", timo);
+		kproc_suspend_check(compactproc);
+
+		vm_domain_free_lock(dom);
+		frag_idx = vm_phys_fragmentation_index(VM_LEVEL_0_ORDER,
+		    domain);
+		vm_domain_free_unlock(dom);
+
+		nretries = 0;
+
+		/*
+		 * Run compaction until the fragmentation metric stops
+		 * improving.
+		 */
+		do {
+			/*
+			 * No need to compact if fragmentation is below the
+			 * threshold.
+			 */
+			if (frag_idx < vm_phys_compact_thresh) {
+				break;
+			}
+
+			/* Find eligible memory regions. */
+			if (vm_phys_compact_search(ctx, domain) == 0) {
+				nrelocated = 0;
+			} else {
+				old_frag_idx = frag_idx;
+
+				nrelocated = vm_phys_compact(ctx, domain);
+				/* An error occured. */
+				if (nrelocated < 0) {
+					break;
+				}
+
+				vm_domain_free_lock(dom);
+				frag_idx = vm_phys_fragmentation_index(
+				    VM_LEVEL_0_ORDER, domain);
+				vm_domain_free_unlock(dom);
+			}
+
+			if (nrelocated == 0 || (frag_idx >= old_frag_idx)) {
+				nretries++;
+			} else {
+				nretries = 0;
+			}
+		} while (nretries < 10);
+
+		/* If compaction was not able to lower the fragmentation score,
+		 * sleep for a longer period of time.  */
+		if (nretries == 10) {
+			timo = hz / 8;
+		} else {
+			timo = 2 * hz;
+		}
+	}
+}
+
+static void
+vm_phys_compact_daemon(void)
+{
+	int error;
+	struct vm_phys_compact_ctx *ctx;
+
+	EVENTHANDLER_REGISTER(shutdown_pre_sync, kproc_shutdown, compactproc,
+	    SHUTDOWN_PRI_FIRST);
+
+	for (size_t i = 0; i < vm_ndomains; i++) {
+		/* Initialize compaction context */
+		ctx = &compact_ctx[i];
+		ctx->sip = &vm_phys_search_index[i];
+
+		error = kproc_kthread_add(vm_phys_compact_thread, (void *)i,
+		    &compactproc, &ctx->kthr, 0, 0, "compactd", "compact%zu",
+		    i);
+		if (error) {
+			panic("%s: cannot start compaction thread, error: %d",
+			    __func__, error);
+		}
+	}
+}
+
+static struct kproc_desc compact_kp = { "compactdaemon", vm_phys_compact_daemon,
+	&compactproc };
+SYSINIT(compactdaemon, SI_SUB_KTHREAD_VM, SI_ORDER_ANY, kproc_start,
+    &compact_kp);
+
+static int sysctl_vm_phys_compact(SYSCTL_HANDLER_ARGS);
+SYSCTL_OID(_vm, OID_AUTO, phys_compact, CTLTYPE_STRING | CTLFLAG_RD, NULL, 0,
+    sysctl_vm_phys_compact, "A", "Compact physical memory");
+
+static int
+sysctl_vm_phys_compact(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbuf;
+	int error;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sbuf, NULL, 32, req);
+
+	for (int i = 0; i < vm_ndomains; i++) {
+		/* XXX: first and second thread share same chan */
+		wakeup_one(&compact_ctx[i]);
+	}
+
+	sbuf_printf(&sbuf, "Kicked compaction daemon");
+
+	error = sbuf_finish(&sbuf);
+	sbuf_delete(&sbuf);
+
+	return (error);
+}
