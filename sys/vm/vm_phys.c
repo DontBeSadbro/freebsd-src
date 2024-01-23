@@ -2458,7 +2458,7 @@ vm_phys_compact_page_relocatable(vm_page_t p)
 
 	VM_OBJECT_WLOCK(obj);
 	if (obj != p->object ||
-	    (obj->type != OBJT_DEFAULT && obj->type != OBJT_VNODE)) {
+	    ((obj->flags & OBJ_SWAP) == 0 && obj->type != OBJT_VNODE)) {
 		goto unlock;
 	}
 
