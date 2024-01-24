@@ -768,63 +768,58 @@ out:
  *
  * The object must be locked.
  */
-vm_page_t
-vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain,
-                       int req, u_long npages, vm_page_t *ma)
+int
+vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_page_t mpred, int req,
+                       vm_page_t *ma, u_long npages)
 {
 	struct vm_domain *vmd;
-	vm_paddr_t pa, size;
-	vm_page_t m, m_ret, msucc;
-	vm_pindex_t first, leftcap, rightcap;
+	vm_page_t m, _m_succ;
 	vm_reserv_t rv;
-	u_long allocpages, maxpages, minpages;
-	int i, index, n;
+	u_long nallocd;
+	int i;
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
-	KASSERT(npages != 0, ("vm_reserv_alloc_contig: npages is 0"));
+	KASSERT(npages != 0, ("%s: npages is 0", __func__));
 
-	if (pindex < VM_RESERV_INDEX(object, pindex))
-          return (0);
-  /* Clip 'npages' to object size */
-  if (pindex + npages > object->size)
-          npages = obj->size - pindex;
-
+	/* if (pindex < VM_RESERV_INDEX(object, pindex)) */
+  /*         return (0); */
 	/*
 	 * Look for an existing reservation.
 	 */
-	rv = vm_reserv_from_object(object, pindex, mpred, &msucc);
+	rv = vm_reserv_from_object(object, pindex, mpred, &_m_succ);
 	if (rv == NULL)
           return (0);
 
-		KASSERT(object != kernel_object || rv->domain == domain,
-		    ("vm_reserv_alloc_contig: domain mismatch"));
-		index = VM_RESERV_INDEX(object, pindex);
-		domain = rv->domain;
-		vmd = VM_DOMAIN(domain);
-		vm_reserv_lock(rv);
-		/* Handle reclaim race. */
-		if (rv->object != object)
-			goto out;
-    /* Does the allocation fit within the reservation? */
-		if (rv->popcnt + npages > VM_LEVEL_0_NPAGES)
-            /* Clip 'npages' */
-            npages = VM_LEVEL_0_NPAGES - rv->popcnt;
+  KASSERT(object != kernel_object || rv->domain == domain,
+          ("vm_reserv_alloc_contig: domain mismatch"));
+  vmd = VM_DOMAIN(domain);
+  /* Clip 'npages' to object size */
+  if (pindex + npages > object->size)
+          npages = object->size - pindex;
 
-		m = &rv->pages[index];
-    if (!vm_domain_allocate(vmd, req, npages))
-            goto out;
-    nallocd = vm_phys_alloc_from(m, RV_END_PAGE, npages, ma, domain);
-    if(nallocd != npages)
-            vm_domain_freecnt_inc(vmd, npages - nallocd);
+  vm_reserv_lock(rv);
+  /* Handle reclaim race. */
+  if (rv->object != object)
+          goto out;
+  /* Does the allocation fit within the reservation? */
+  if (rv->popcnt + npages > VM_LEVEL_0_NPAGES)
+          /* Clip 'npages' */
+          npages = VM_LEVEL_0_NPAGES - rv->popcnt;
 
-		for (i = 0; i < nallocd; i++)
-			vm_reserv_populate(rv, index + i);
-		vm_reserv_unlock(rv);
-		return (nallocd);
+  if (!vm_domain_allocate(vmd, req, npages))
+          goto out;
+  m = &rv->pages[0];
+  nallocd = vm_phys_alloc_from(m, m + VM_LEVEL_0_NPAGES, npages, ma, domain);
+  if(nallocd != npages)
+          vm_domain_freecnt_inc(vmd, npages - nallocd);
+
+  for(i = 0; i < nallocd; i++)
+          vm_reserv_populate(rv, ma[i] - m);
+  vm_reserv_unlock(rv);
+  return (nallocd);
 out:
-		vm_reserv_unlock(rv);
-		return (0);
-	}
+  vm_reserv_unlock(rv);
+  return (0);
 }
 
 

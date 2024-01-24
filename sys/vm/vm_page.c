@@ -2005,20 +2005,9 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
         printf("%s: domain %d\n", __func__, domain);
         /* Allocate as much pages as possible from the reservation. */
         if (vm_object_reserv(object)){
-                while(got < npages){
-                        m = vm_reserv_alloc_npages(object, pindex, domain, req, ma);
-                        if(m == NULL){
-                                break;
-                        }
-
-                        vm_page_alloc_init_page(object, pindex, m, mpred, req);
-
-                        ma[got] = m;
-                        got++;
-                        pindex++;
-                        mpred = m;
-                }
-                printf("%s: got %d pages using vm_reserv_alloc_page\n", __func__, got);
+                rv = vm_reserv_alloc_npages(object, pindex, domain, mpred, req, ma, npages);
+                got += rv;
+                printf("%s: got %d pages using vm_reserv_alloc_npages\n", __func__, got);
         }
 
         // TODO: select appropriate pool
@@ -2029,14 +2018,14 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
           printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
 
           got += rv;
-
-          mpred = vm_radix_lookup_le(&object->rtree, pindex);
-          for(int i=0; i<got; i++){
-                  m = ma[i];
-                  vm_page_alloc_init_page(object, pindex + i, m, mpred, req);
-                  mpred = m;
-          }
         }
+
+        for(int i=0; i<got; i++){
+                m = ma[i];
+                vm_page_alloc_init_page(object, pindex + i, m, mpred, req);
+                mpred = m;
+        }
+
         return got;
 }
 
@@ -2049,8 +2038,8 @@ vm_page_alloc_pages(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int n
         vm_page_t m, mpred;
 
         /* Clip 'npages' to object size */
-        if (pindex + npages > obj->size)
-                npages = obj->size - pindex;
+        if (pindex + npages > object->size)
+                npages = object->size - pindex;
 
         vm_domainset_batch_iter_page_init(&dbi, object, pindex, npages, &domain, &batch_npages, &req);
         do {

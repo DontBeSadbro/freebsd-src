@@ -51,6 +51,8 @@ vm_page_t	vm_reserv_alloc_contig(vm_object_t object, vm_pindex_t pindex,
 		    vm_paddr_t boundary);
 vm_page_t	vm_reserv_alloc_page(vm_object_t object, vm_pindex_t pindex,
 		    int domain, int req, vm_page_t mpred);
+int vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_page_t mpred, int req,
+                           vm_page_t *ma, u_long npages);
 void		vm_reserv_break_all(vm_object_t object);
 boolean_t	vm_reserv_free_page(vm_page_t m);
 void		vm_reserv_init(void);

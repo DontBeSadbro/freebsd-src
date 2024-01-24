@@ -846,9 +846,8 @@ vm_phys_alloc_npages(int domain, int pool, int npages, vm_page_t ma[])
 
 /*
  * Tries to allocate the specified number of contiguous pages
- * from a specific physical address within a domain. Stops upon encountering an allocated page.
- * Returns the actual number of allocated pages
- * and a pointer to the first page in the allocated run.
+ * from the specified physical address range within a domain.
+ * Returns the actual number of allocated pages.
  *
  * The free page queues for the specified domain must be locked.
  */
@@ -857,7 +856,7 @@ vm_phys_alloc_from(vm_page_t m_start, vm_page_t m_end, int npages, vm_page_t *ma
 {
         int i, oind, rem_oind;
         u_long rem;
-        vm_page_t m, m_end;
+        vm_page_t m;
         struct vm_freelist *fl;
         struct vm_freelist (*queues)[VM_NFREEPOOL][VM_NFREEORDER_MAX];
 
@@ -881,6 +880,7 @@ vm_phys_alloc_from(vm_page_t m_start, vm_page_t m_end, int npages, vm_page_t *ma
 
                 queues = vm_phys_segs[m->segind].free_queues;
                 fl = (*queues)[m->pool];
+                vm_freelist_rem(fl, m, oind);
                 /* Check whether this allocation overshoots. */
                 if(m + (1 << oind) >= m_end){
                         /* Round no. remaining pages down to nearest order and split page */
@@ -889,7 +889,6 @@ vm_phys_alloc_from(vm_page_t m_start, vm_page_t m_end, int npages, vm_page_t *ma
                         vm_phys_split_pages(m, oind, fl, rem_oind, 0);
                         oind = rem_oind;
                 }
-                vm_freelist_rem(fl, m, oind);
                 ma[i] = m;
                 /* Skip over allocated pages. */
                 m += (1 << oind);
