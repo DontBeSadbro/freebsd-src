@@ -773,10 +773,11 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
                        vm_page_t *ma, u_long npages)
 {
 	struct vm_domain *vmd;
-	vm_page_t m, _m_succ;
+	vm_page_t m, msucc, m_end;
+  vm_pindex_t first, leftcap, rightcap;
 	vm_reserv_t rv;
 	u_long nallocd;
-	int i;
+	int i, index;
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
 	KASSERT(npages != 0, ("%s: npages is 0", __func__));
@@ -786,10 +787,68 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
 	/*
 	 * Look for an existing reservation.
 	 */
-	rv = vm_reserv_from_object(object, pindex, mpred, &_m_succ);
-	if (rv == NULL)
-          return (0);
+	rv = vm_reserv_from_object(object, pindex, mpred, &msucc);
+	if (rv == NULL){
+          /*
+           * Could a reservation fit between the first index to the left that
+           * can be used and the first index to the right that cannot be used?
+           *
+           * We must synchronize with the reserv object lock to protect the
+           * pindex/object of the resulting reservations against rename while
+           * we are inspecting.
+           */
+          first = pindex - VM_RESERV_INDEX(object, pindex);
+          vm_reserv_object_lock(object);
+          if (mpred != NULL) {
+                  if ((rv = vm_reserv_from_page(mpred))->object != object)
+                          leftcap = mpred->pindex + 1;
+                  else
+                          leftcap = rv->pindex + VM_LEVEL_0_NPAGES;
+                  if (leftcap > first) {
+                          vm_reserv_object_unlock(object);
+                          return (0);
+                  }
+          }
+          if (msucc != NULL) {
+                  if ((rv = vm_reserv_from_page(msucc))->object != object)
+                          rightcap = msucc->pindex;
+                  else
+                          rightcap = rv->pindex;
+                  if (first + VM_LEVEL_0_NPAGES > rightcap) {
+                          vm_reserv_object_unlock(object);
+                          return (0);
+                  }
+          }
+          vm_reserv_object_unlock(object);
 
+          /*
+           * Would the last new reservation extend past the end of the object?
+           *
+           * If the object is unlikely to grow don't allocate a reservation for
+           * the tail.
+           */
+          if ((object->flags & OBJ_ANON) == 0 &&
+              first + VM_LEVEL_0_NPAGES > object->size)
+                  return (0);
+
+          /*
+           * Allocate and populate the new reservation.
+           */
+          m = NULL;
+          vmd = VM_DOMAIN(domain);
+          if (vm_domain_allocate(vmd, req, 1)) {
+                  vm_domain_free_lock(vmd);
+                  m = vm_phys_alloc_pages(domain, VM_FREEPOOL_DEFAULT,
+                                          VM_LEVEL_0_ORDER);
+                  vm_domain_free_unlock(vmd);
+                  if (m == NULL) {
+                          vm_domain_freecnt_inc(vmd, 1);
+                          return (0);
+                  }
+          } else
+                  return (0);
+          rv = vm_reserv_from_page(m);
+  }
   KASSERT(object != kernel_object || rv->domain == domain,
           ("vm_reserv_alloc_contig: domain mismatch"));
   vmd = VM_DOMAIN(domain);
@@ -808,13 +867,16 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
 
   if (!vm_domain_allocate(vmd, req, npages))
           goto out;
-  m = &rv->pages[0];
-  nallocd = vm_phys_alloc_from(m, m + VM_LEVEL_0_NPAGES, npages, ma, domain);
+  /* Allocate n pages from 'index' onward */
+  index = VM_RESERV_INDEX(object, pindex);
+  m = &rv->pages[index];
+  m_end = &rv->pages[0] + VM_LEVEL_0_NPAGES;
+  nallocd = vm_phys_alloc_from(m, m_end, npages, ma, domain);
   if(nallocd != npages)
           vm_domain_freecnt_inc(vmd, npages - nallocd);
 
   for(i = 0; i < nallocd; i++)
-          vm_reserv_populate(rv, ma[i] - m);
+          vm_reserv_populate(rv, ma[i] - &rv->pages[0]);
   vm_reserv_unlock(rv);
   return (nallocd);
 out:
