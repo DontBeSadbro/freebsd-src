@@ -773,22 +773,25 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
                        vm_page_t *ma, u_long npages)
 {
 	struct vm_domain *vmd;
-	vm_page_t m, msucc, m_end;
+	vm_page_t m, msucc;
   vm_pindex_t first, leftcap, rightcap;
 	vm_reserv_t rv;
-	u_long nallocd;
-	int i, index;
+	int index, got;
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
 	KASSERT(npages != 0, ("%s: npages is 0", __func__));
 
-	/* if (pindex < VM_RESERV_INDEX(object, pindex)) */
-  /*         return (0); */
+  /*
+	 * Is a reservation fundamentally impossible?
+	 */
+	if (pindex < VM_RESERV_INDEX(object, pindex) ||
+	    pindex >= object->size)
+          return (0);
 	/*
 	 * Look for an existing reservation.
 	 */
 	rv = vm_reserv_from_object(object, pindex, mpred, &msucc);
-	if (rv == NULL){
+	if (rv == NULL) {
           /*
            * Could a reservation fit between the first index to the left that
            * can be used and the first index to the right that cannot be used?
@@ -847,41 +850,32 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
                   }
           } else
                   return (0);
-          rv = vm_reserv_from_page(m);
-  }
-  KASSERT(object != kernel_object || rv->domain == domain,
-          ("vm_reserv_alloc_contig: domain mismatch"));
-  vmd = VM_DOMAIN(domain);
-  /* Clip 'npages' to object size */
-  if (pindex + npages > object->size)
-          npages = object->size - pindex;
 
+          rv = vm_reserv_from_page(m);
+ 	}
+
+  KASSERT(object != kernel_object || rv->domain == domain,
+          ("vm_reserv_alloc_page: domain mismatch"));
   vm_reserv_lock(rv);
   /* Handle reclaim race. */
-  if (rv->object != object)
-          goto out;
-  /* Does the allocation fit within the reservation? */
-  if (rv->popcnt + npages > VM_LEVEL_0_NPAGES)
-          /* Clip 'npages' */
-          npages = VM_LEVEL_0_NPAGES - rv->popcnt;
-
-  if (!vm_domain_allocate(vmd, req, npages))
-          goto out;
-  /* Allocate n pages from 'index' onward */
+  if (rv->object != object) {
+          vm_reserv_unlock(rv);
+          return (0);
+  }
   index = VM_RESERV_INDEX(object, pindex);
-  m = &rv->pages[index];
-  m_end = &rv->pages[0] + VM_LEVEL_0_NPAGES;
-  nallocd = vm_phys_alloc_from(m, m_end, npages, ma, domain);
-  if(nallocd != npages)
-          vm_domain_freecnt_inc(vmd, npages - nallocd);
+  got = 0;
+  /* Scan bitmap and allocate pages */
+  for(;index < (VM_LEVEL_0_NPAGES - 1); index++){
+          /* Test whether page at 'index' is free */
+          if(bit_test(rv->popmap, index) ||
+             vm_domain_allocate(vmd, req, 1) == 0)
+                  continue;
+          vm_reserv_populate(rv, index);
+          ma[got] = &rv->pages[index];
+          got++;
+  }
 
-  for(i = 0; i < nallocd; i++)
-          vm_reserv_populate(rv, ma[i] - &rv->pages[0]);
-  vm_reserv_unlock(rv);
-  return (nallocd);
-out:
-  vm_reserv_unlock(rv);
-  return (0);
+  return got;
 }
 
 

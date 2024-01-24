@@ -1954,46 +1954,47 @@ static void
 vm_page_alloc_init_page(vm_object_t object, vm_pindex_t pindex, vm_page_t m, vm_page_t mpred, int req){
         int flags = 0;
 
-          vm_page_dequeue(m);
-          vm_page_alloc_check(m);
+        vm_page_dequeue(m);
+        vm_page_alloc_check(m);
 
-          /*
-           * Initialize the page.  Only the PG_ZERO flag is inherited.
-           */
-          flags |= m->flags & PG_ZERO;
-          if ((req & VM_ALLOC_NODUMP) != 0)
-            flags |= PG_NODUMP;
-          m->flags = flags;
-          m->a.flags = 0;
-          m->oflags = (object->flags & OBJ_UNMANAGED) != 0 ? VPO_UNMANAGED : 0;
-          if ((req & (VM_ALLOC_NOBUSY | VM_ALLOC_SBUSY)) == 0)
-            m->busy_lock = VPB_CURTHREAD_EXCLUSIVE;
-          else if ((req & VM_ALLOC_SBUSY) != 0)
-            m->busy_lock = VPB_SHARERS_WORD(1);
-          else
-            m->busy_lock = VPB_UNBUSIED;
-          if (req & VM_ALLOC_WIRED) {
-            vm_wire_add(1);
-            m->ref_count = 1;
-          }
-          m->a.act_count = 0;
+        /*
+         * Initialize the page.  Only the PG_ZERO flag is inherited.
+         */
+        flags |= m->flags & PG_ZERO;
+        if ((req & VM_ALLOC_NODUMP) != 0)
+                flags |= PG_NODUMP;
+        m->flags = flags;
+        m->a.flags = 0;
+        m->oflags = (object->flags & OBJ_UNMANAGED) != 0 ? VPO_UNMANAGED : 0;
+        if ((req & (VM_ALLOC_NOBUSY | VM_ALLOC_SBUSY)) == 0)
+                m->busy_lock = VPB_CURTHREAD_EXCLUSIVE;
+        else if ((req & VM_ALLOC_SBUSY) != 0)
+                m->busy_lock = VPB_SHARERS_WORD(1);
+        else
+                m->busy_lock = VPB_UNBUSIED;
+        if (req & VM_ALLOC_WIRED) {
+                vm_wire_add(1);
+                m->ref_count = 1;
+        }
+        m->a.act_count = 0;
 
-          if (vm_page_insert_after(m, object, pindex, mpred)) {
-            if (req & VM_ALLOC_WIRED) {
-              vm_wire_sub(1);
-              m->ref_count = 0;
-            }
-            KASSERT(m->object == NULL, ("page %p has object", m));
-            m->oflags = VPO_UNMANAGED;
-            m->busy_lock = VPB_UNBUSIED;
-            /* Don't change PG_ZERO. */
-            vm_page_free_toq(m);
-            if (req & VM_ALLOC_WAITFAIL) {
-              VM_OBJECT_WUNLOCK(object);
-              vm_radix_wait();
-              VM_OBJECT_WLOCK(object);
-            }
-          }
+        if (vm_page_insert_after(m, object, pindex, mpred)) {
+                if (req & VM_ALLOC_WIRED) {
+                        vm_wire_sub(1);
+                        m->ref_count = 0;
+                }
+                KASSERT(m->object == NULL, ("page %p has object", m));
+                m->oflags = VPO_UNMANAGED;
+                m->busy_lock = VPB_UNBUSIED;
+                /* Don't change PG_ZERO. */
+                vm_page_free_toq(m);
+                if (req & VM_ALLOC_WAITFAIL) {
+                        VM_OBJECT_WUNLOCK(object);
+                        printf("%s: waiting\n", __func__);
+                        vm_radix_wait();
+                        VM_OBJECT_WLOCK(object);
+                }
+        }
 }
 
 static int
@@ -2035,7 +2036,7 @@ vm_page_alloc_pages(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int n
 
         int domain, batch_npages;
         int got = 0;
-        vm_page_t m, mpred;
+        vm_page_t  mpred;
 
         /* Clip 'npages' to object size */
         if (pindex + npages > object->size)
@@ -2045,11 +2046,11 @@ vm_page_alloc_pages(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma, int n
         do {
                 mpred = vm_radix_lookup_le(&object->rtree, pindex + got);
                 /* Initialize mpred so reservation allocs go through */
-                if(mpred != NULL && mpred->object == NULL){
-                        m = mpred;
-                        mpred = vm_radix_lookup_le(&object->rtree, pindex + got-1);
-                        vm_page_alloc_init_page(object, pindex + got, m, mpred, req);
-                }
+                /* if(mpred != NULL && mpred->object == NULL){ */
+                /*         m = mpred; */
+                /*         mpred = vm_radix_lookup_le(&object->rtree, pindex + got-1); */
+                /*         vm_page_alloc_init_page(object, pindex + got, m, mpred, req); */
+                /* } */
 
                 if(got + batch_npages > npages){
                         batch_npages = npages - got;
