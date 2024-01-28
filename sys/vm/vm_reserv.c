@@ -780,6 +780,7 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
 	KASSERT(npages != 0, ("%s: npages is 0", __func__));
+  	vmd = VM_DOMAIN(domain);
 
   /*
 	 * Is a reservation fundamentally impossible?
@@ -838,7 +839,6 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
            * Allocate and populate the new reservation.
            */
           m = NULL;
-          vmd = VM_DOMAIN(domain);
           if (vm_domain_allocate(vmd, req, 1)) {
                   vm_domain_free_lock(vmd);
                   m = vm_phys_alloc_pages(domain, VM_FREEPOOL_DEFAULT,
@@ -852,29 +852,33 @@ vm_reserv_alloc_npages(vm_object_t object, vm_pindex_t pindex, int domain, vm_pa
                   return (0);
 
           rv = vm_reserv_from_page(m);
- 	}
+		vm_reserv_lock(rv);
+   KASSERT(rv->pages == m,
+            ("vm_reserv_alloc_page: reserv %p's pages is corrupted", rv));
+	        vm_reserv_insert(rv, object, first);
+ 	} else {
+		vm_reserv_lock(rv);
+	}
 
   KASSERT(object != kernel_object || rv->domain == domain,
           ("vm_reserv_alloc_page: domain mismatch"));
-  vm_reserv_lock(rv);
-  /* Handle reclaim race. */
-  if (rv->object != object) {
-          vm_reserv_unlock(rv);
-          return (0);
-  }
+
   index = VM_RESERV_INDEX(object, pindex);
   got = 0;
   /* Scan bitmap and allocate pages */
-  for(;index < (VM_LEVEL_0_NPAGES - 1); index++){
+  for(;index < VM_LEVEL_0_NPAGES  && got < npages; index++){
           /* Test whether page at 'index' is free */
-          if(bit_test(rv->popmap, index) ||
-             vm_domain_allocate(vmd, req, 1) == 0)
+          if(bit_test(rv->popmap, index))
                   continue;
           vm_reserv_populate(rv, index);
           ma[got] = &rv->pages[index];
           got++;
   }
+  if(vm_domain_allocate(vmd, req, got) == 0){
+	// TODO: idk
+  }
 
+vm_reserv_unlock(rv);
   return got;
 }
 

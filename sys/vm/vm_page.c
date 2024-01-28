@@ -2008,13 +2008,18 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
         int got = 0, rv;
         vm_page_t m;
         struct vm_domain *vmd = VM_DOMAIN(domain);
-
-        printf("%s: domain %d\n", __func__, domain);
+	
+	KASSERT(npages > 0, ("%s: npages is negative: %d", __func__, npages));
+    //    printf("%s: domain %d, npages %d\n", __func__, domain, npages);
         /* Allocate as much pages as possible from the reservation. */
         if (vm_object_reserv(object)){
-                rv = vm_reserv_alloc_npages(object, pindex, domain, mpred, req, ma, npages);
-                got += rv;
-                printf("%s: got %d pages using vm_reserv_alloc_npages\n", __func__, got);
+	//	while (got < npages){
+                	rv = vm_reserv_alloc_npages(object, pindex, domain, mpred, req, ma, npages);
+	//		if (rv == 0)
+	//			break;
+                	got += rv;
+	//	}
+//                printf("%s: got %d pages using vm_reserv_alloc_npages\n", __func__, got);
         }
 
         // TODO: select appropriate pool
@@ -2024,7 +2029,7 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
                         vm_domain_free_lock(vmd);
                         rv = vm_phys_alloc_npages(domain, 0, min(npages - got, 1 << (VM_NFREEORDER - 1)), &ma[got]);
                         vm_domain_free_unlock(vmd);
-                        printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
+  //                      printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
                         if (rv == 0)
                                 break;
                         got += rv;
