@@ -1994,7 +1994,13 @@ vm_page_alloc_init_page(vm_object_t object, vm_pindex_t pindex, vm_page_t m, vm_
                         vm_radix_wait();
                         VM_OBJECT_WLOCK(object);
                 }
+                /* TODO: figure out how to handle insert failure */
         }
+
+        /* Ignore device objects; the pager sets "memattr" for them. */
+        if (object->memattr != VM_MEMATTR_DEFAULT &&
+            (object->flags & OBJ_FICTITIOUS) == 0)
+                pmap_page_set_memattr(m, object->memattr);
 }
 
 static int
@@ -2013,12 +2019,16 @@ vm_page_alloc_pages_domain(vm_object_t object, vm_pindex_t pindex, vm_page_t *ma
 
         // TODO: select appropriate pool
         if(got < npages){
-          vm_domain_free_lock(vmd);
-          rv = vm_phys_alloc_npages(domain, 0, npages - got, &ma[got]);
-          vm_domain_free_unlock(vmd);
-          printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
-
-          got += rv;
+                /* vm_phys_alloc_npage can only handle (1 << NFREEORDER-1) pages at a time. */
+                while (got < npages){
+                        vm_domain_free_lock(vmd);
+                        rv = vm_phys_alloc_npages(domain, 0, min(npages - got, 1 << (VM_NFREEORDER - 1)), &ma[got]);
+                        vm_domain_free_unlock(vmd);
+                        printf("%s: got %d pages using vm_phys_alloc_npages\n", __func__, rv);
+                        if (rv == 0)
+                                break;
+                        got += rv;
+                }
         }
 
         for(int i=0; i<got; i++){
