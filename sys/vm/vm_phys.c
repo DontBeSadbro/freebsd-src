@@ -2440,7 +2440,7 @@ vm_phys_compact_search(struct vm_phys_compact_ctx *ctx, int domain)
 static __noinline bool
 vm_phys_compact_page_free(vm_page_t p)
 {
-	return (p->order != VM_NFREEORDER);
+	return (p->order < VM_LEVEL_0_ORDER);
 }
 
 /*
