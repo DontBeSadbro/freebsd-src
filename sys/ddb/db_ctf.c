@@ -57,11 +57,11 @@ sym_to_objtoff(linker_ctf_t *lc, const Elf_Sym *sym, const Elf_Sym *symtab,
 
 	/* Ignore non-object symbols */
 	if (ELF_ST_TYPE(sym->st_info) != STT_OBJECT) {
-		return DB_CTF_INVALID_OFF;
+		return (DB_CTF_INVALID_OFF);
 	}
 	/* Sanity check */
 	if (!(sym >= symtab && sym <= symtab_end)) {
-		return DB_CTF_INVALID_OFF;
+		return (DB_CTF_INVALID_OFF);
 	}
 
 	for (const Elf_Sym *symp = symtab; symp < symtab_end; symp++) {
@@ -87,7 +87,7 @@ sym_to_objtoff(linker_ctf_t *lc, const Elf_Sym *sym, const Elf_Sym *symtab,
 		objtoff += idwidth;
 	}
 
-	return objtoff;
+	return (objtoff);
 }
 
 /*
@@ -96,7 +96,8 @@ sym_to_objtoff(linker_ctf_t *lc, const Elf_Sym *sym, const Elf_Sym *symtab,
 static u_int
 db_ctf_type_size(struct ctf_type_v3 *t)
 {
-	u_int vlen, kind, ssize, type_struct_size, kind_size;
+	u_int vlen, kind, ssize;
+	u_int type_struct_size, kind_size;
 
 	vlen = CTF_V3_INFO_VLEN(t->ctt_info);
 	kind = CTF_V3_INFO_KIND(t->ctt_info);
@@ -138,10 +139,10 @@ db_ctf_type_size(struct ctf_type_v3 *t)
 		break;
 	default:
 		db_printf("Error: invalid CTF type kind encountered\n");
-		return -1;
+		return (-1);
 	}
 
-	return type_struct_size + kind_size;
+	return (type_struct_size + kind_size);
 }
 
 /*
@@ -165,7 +166,7 @@ db_ctf_typename_to_type(linker_ctf_t *lc, const char *name)
 	    hp->cth_stroff;
 	end = cur + hp->cth_strlen;
 	while (cur < end) {
-		if (!strcmp(cur, name))
+		if (strcmp(cur, name) == 0)
 			break;
 		cur += strlen(cur) + 1;
 	}
@@ -245,9 +246,6 @@ db_ctf_typeid_to_type(db_ctf_sym_data_t sd, uint32_t typeid)
 	}
 }
 
-/*
- * Returns
- */
 const char *
 db_ctf_stroff_to_str(db_ctf_sym_data_t sd, uint32_t off)
 {
@@ -256,14 +254,14 @@ db_ctf_stroff_to_str(db_ctf_sym_data_t sd, uint32_t off)
 	const char *ret;
 
 	if (stroff >= (hp->cth_stroff + hp->cth_strlen)) {
-		return "invalid";
+		return ("invalid");
 	}
 	ret = ((const char *)hp + sizeof(ctf_header_t)) + stroff;
 	if (*ret == '\0') {
-		return NULL;
+		return (NULL);
 	}
 
-	return ret;
+	return (ret);
 }
 
 /*
@@ -291,7 +289,7 @@ db_ctf_sym_to_type(db_ctf_sym_data_t sd)
 	typeid = *(
 	    const uint32_t *)(sd->lc.ctftab + sizeof(ctf_header_t) + objtoff);
 
-	return db_ctf_typeid_to_type(sd, typeid);
+	return (db_ctf_typeid_to_type(sd, typeid));
 }
 
 /*
@@ -321,7 +319,7 @@ db_ctf_find_symbol(const char *name, db_ctf_sym_data_t sd)
 struct ctf_type_v3 *
 db_ctf_find_typename(db_ctf_sym_data_t sd, const char *typename)
 {
-	if (linker_ctf_lookup_typename_ddb(&sd->lc, typename)) {
+	if (linker_ctf_lookup_typename_ddb(&sd->lc, typename) != 0) {
 		return (NULL);
 	}
 	return (db_ctf_typename_to_type(&sd->lc, typename));

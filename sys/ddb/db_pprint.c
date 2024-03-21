@@ -52,11 +52,15 @@ static struct db_ctf_sym_data sym_data;
 static inline void
 db_pprint_int(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 {
-	size_t type_struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
+	uint32_t data;
+	size_t type_struct_size;
+
+	type_struct_size = (type->ctt_size == CTF_V3_LSIZE_SENT) ?
 		sizeof(struct ctf_type_v3) :
-		sizeof(struct ctf_stype_v3));
-	uint32_t data = db_get_value((db_expr_t)type + type_struct_size,
-	    sizeof(uint32_t), 0);
+		sizeof(struct ctf_stype_v3);
+
+	data = db_get_value((db_expr_t)type + type_struct_size,
+		sizeof(uint32_t), 0);
 	u_int bits = CTF_INT_BITS(data);
 	boolean_t sign = !!(CTF_INT_ENCODING(data) & CTF_INT_SIGNED);
 
@@ -78,16 +82,20 @@ db_pprint_int(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 static inline void
 db_pprint_struct(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 {
-	size_t type_struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
-		sizeof(struct ctf_type_v3) :
-		sizeof(struct ctf_stype_v3));
-	size_t struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
-		CTF_TYPE_LSIZE(type) :
-		type->ctt_size);
-	u_int vlen = CTF_V3_INFO_VLEN(type->ctt_info);
+	size_t type_struct_size;
+	size_t struct_size;
 	struct ctf_type_v3 *mtype;
 	const char *mname;
 	db_addr_t maddr;
+	u_int vlen;
+
+	type_struct_size = (type->ctt_size == CTF_V3_LSIZE_SENT) ?
+		sizeof(struct ctf_type_v3) :
+		sizeof(struct ctf_stype_v3);
+	struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
+		CTF_TYPE_LSIZE(type) :
+		type->ctt_size);
+	vlen = CTF_V3_INFO_VLEN(type->ctt_info);
 
 	if (db_pager_quit) {
 		return;
@@ -112,7 +120,7 @@ db_pprint_struct(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 			maddr = addr + mp->ctm_offset;
 			mname = db_ctf_stroff_to_str(&sym_data, mp->ctm_name);
 			db_indent = depth;
-			if (mname) {
+			if (mname != NULL) {
 				db_iprintf("%s = ", mname);
 			} else {
 				db_iprintf("");
@@ -135,7 +143,7 @@ db_pprint_struct(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 			maddr = addr + CTF_LMEM_OFFSET(mp);
 			mname = db_ctf_stroff_to_str(&sym_data, mp->ctlm_name);
 			db_indent = depth;
-			if (mname) {
+			if (mname != NULL) {
 				db_iprintf("%s = ", mname);
 			} else {
 				db_iprintf("");
@@ -156,14 +164,15 @@ db_pprint_struct(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 static inline void
 db_pprint_arr(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 {
-	struct ctf_array_v3 *arr;
 	struct ctf_type_v3 *elem_type;
+	struct ctf_array_v3 *arr;
 	db_addr_t elem_addr, end;
+	size_t type_struct_size;
 	size_t elem_size;
-	size_t type_struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
-		sizeof(struct ctf_type_v3) :
-		sizeof(struct ctf_stype_v3));
 
+	type_struct_size = (type->ctt_size == CTF_V3_LSIZE_SENT) ?
+		sizeof(struct ctf_type_v3) :
+		sizeof(struct ctf_stype_v3);
 	arr = (struct ctf_array_v3 *)((db_addr_t)type + type_struct_size);
 	elem_type = db_ctf_typeid_to_type(&sym_data, arr->cta_contents);
 	elem_size = ((elem_type->ctt_size == CTF_V3_LSIZE_SENT) ?
@@ -197,12 +206,16 @@ static inline void
 db_pprint_enum(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 {
 	struct ctf_enum *ep, *endp;
+	size_t type_struct_size;
 	const char *valname;
-	u_int vlen = CTF_V3_INFO_VLEN(type->ctt_info);
-	db_expr_t val = db_get_value(addr, sizeof(int), 0);
-	size_t type_struct_size = ((type->ctt_size == CTF_V3_LSIZE_SENT) ?
+	db_expr_t val;
+	u_int vlen;
+
+	type_struct_size = (type->ctt_size == CTF_V3_LSIZE_SENT) ?
 		sizeof(struct ctf_type_v3) :
-		sizeof(struct ctf_stype_v3));
+		sizeof(struct ctf_stype_v3);
+	vlen = CTF_V3_INFO_VLEN(type->ctt_info);
+	val = db_get_value(addr, sizeof(int), 0);
 
 	if (db_pager_quit) {
 		return;
@@ -212,7 +225,7 @@ db_pprint_enum(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 	for (; ep < endp; ep++) {
 		if (val == ep->cte_value) {
 			valname = db_ctf_stroff_to_str(&sym_data, ep->cte_name);
-			if (valname)
+			if (valname != NULL)
 				db_printf("%s (0x%lx)", valname, val);
 			else
 				db_printf("(0x%lx)", val);
@@ -230,11 +243,11 @@ db_pprint_enum(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 static inline void
 db_pprint_ptr(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 {
+	struct ctf_type_v3 *ref_type;
 	const char *qual = "";
 	const char *name;
-	struct ctf_type_v3 *ref_type;
-	u_int kind;
 	db_addr_t val;
+	u_int kind;
 
 	ref_type = db_ctf_typeid_to_type(&sym_data, type->ctt_type);
 	kind = CTF_V3_INFO_KIND(ref_type->ctt_info);
@@ -259,7 +272,7 @@ db_pprint_ptr(db_addr_t addr, struct ctf_type_v3 *type, u_int depth)
 	} else {
 		name = db_ctf_stroff_to_str(&sym_data, ref_type->ctt_name);
 		db_indent = depth;
-		if (name)
+		if (name != NULL)
 			db_printf("(%s%s *) 0x%lx", qual, name, val);
 		else
 			db_printf("0x%lx", val);
@@ -328,13 +341,13 @@ db_pprint_symbol_cmd(const char *name)
 {
 	db_addr_t addr;
 	int db_indent_old;
-	struct ctf_type_v3 *type = NULL;
 	const char *type_name = NULL;
+	struct ctf_type_v3 *type = NULL;
 
 	if (db_pager_quit) {
 		return;
 	}
-	if (db_ctf_find_symbol(name, &sym_data)) {
+	if (db_ctf_find_symbol(name, &sym_data) != 0) {
 		db_error("Symbol not found\n");
 	}
 	if (ELF_ST_TYPE(sym_data.sym->st_info) != STT_OBJECT) {
@@ -342,11 +355,11 @@ db_pprint_symbol_cmd(const char *name)
 	}
 	addr = sym_data.sym->st_value;
 	type = db_ctf_sym_to_type(&sym_data);
-	if (!type) {
+	if (type == NULL) {
 		db_error("Can't find CTF type info\n");
 	}
 	type_name = db_ctf_stroff_to_str(&sym_data, type->ctt_name);
-	if (type_name)
+	if (type_name != NULL)
 		db_printf("%s ", type_name);
 	db_printf("%s = ", name);
 
@@ -365,9 +378,8 @@ db_pprint_struct_cmd(db_expr_t addr, const char *struct_name)
 	int db_indent_old;
 	struct ctf_type_v3 *type = NULL;
 
-	// TODO: check whether rv is a struct type
 	type = db_ctf_find_typename(&sym_data, struct_name);
-	if (!type) {
+	if (type == NULL) {
 		db_error("Can't find CTF type info\n");
 		return;
 	}
@@ -401,7 +413,7 @@ db_pprint_cmd(db_expr_t addr, bool have_addr, db_expr_t count, char *modif)
 			db_error("Invalid flag passed\n");
 		}
 		/* Parse desired depth level */
-		if (!strcmp(db_tok_string, "d")) {
+		if (strcmp(db_tok_string, "d") == 0) {
 			t = db_read_token();
 			if (t != tNUMBER) {
 				db_error("Invalid depth provided\n");
@@ -415,7 +427,7 @@ db_pprint_cmd(db_expr_t addr, bool have_addr, db_expr_t count, char *modif)
 	}
 	/* Parse subcomannd */
 	if (t == tIDENT) {
-		if (!strcmp(db_tok_string, "struct")) {
+		if (strcmp(db_tok_string, "struct") == 0) {
 			t = db_read_token();
 
 			if (t != tIDENT) {
@@ -423,7 +435,7 @@ db_pprint_cmd(db_expr_t addr, bool have_addr, db_expr_t count, char *modif)
 			}
 			name = db_tok_string;
 
-			if (!db_expression(&addr)) {
+			if (db_expression(&addr) == 0) {
 				db_error("Address not provided\n");
 			}
 			db_pprint_struct_cmd(addr, name);
