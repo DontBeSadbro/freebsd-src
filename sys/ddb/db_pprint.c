@@ -347,6 +347,8 @@ db_pprint_symbol_cmd(const char *name)
 	if (db_pager_quit) {
 		return;
 	}
+	/* Clear symbol and CTF info */
+	memset(&sym_data, 0, sizeof(struct db_ctf_sym_data));
 	if (db_ctf_find_symbol(name, &sym_data) != 0) {
 		db_error("Symbol not found\n");
 	}
@@ -403,8 +405,6 @@ db_pprint_cmd(db_expr_t addr, bool have_addr, db_expr_t count, char *modif)
 
 	/* Set default depth */
 	max_depth = DB_PPRINT_DEFAULT_DEPTH;
-	/* Clear symbol and CTF info */
-	bzero(&sym_data, sizeof(sym_data));
 	/* Parse print modifiers */
 	t = db_read_token();
 	if (t == tSLASH) {
