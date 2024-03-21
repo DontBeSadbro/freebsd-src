@@ -446,4 +446,5 @@ db_pprint_cmd(db_expr_t addr, bool have_addr, db_expr_t count, char *modif)
 	} else {
 		db_error("Invalid subcommand\n");
 	}
+	db_skip_to_eol();
 }
