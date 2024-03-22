@@ -718,12 +718,14 @@ ddb/db_access.c			optional ddb
 ddb/db_break.c			optional ddb
 ddb/db_capture.c		optional ddb
 ddb/db_command.c		optional ddb
+ddb/db_ctf.c			optional ddb
 ddb/db_examine.c		optional ddb
 ddb/db_expr.c			optional ddb
 ddb/db_input.c			optional ddb
 ddb/db_lex.c			optional ddb
 ddb/db_main.c			optional ddb
 ddb/db_output.c			optional ddb
+ddb/db_pprint.c			optional ddb
 ddb/db_print.c			optional ddb
 ddb/db_ps.c			optional ddb
 ddb/db_run.c			optional ddb
@@ -734,8 +736,6 @@ ddb/db_textdump.c		optional ddb
 ddb/db_variables.c		optional ddb
 ddb/db_watch.c			optional ddb
 ddb/db_write_cmd.c		optional ddb
-ddb/db_pprint.c			optional ddb
-ddb/db_ctf.c			optional ddb
 dev/aac/aac.c			optional aac
 dev/aac/aac_cam.c		optional aacp aac
 dev/aac/aac_debug.c		optional aac

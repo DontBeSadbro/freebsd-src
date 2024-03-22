@@ -813,7 +813,7 @@ linker_ctf_lookup_typename_ddb(linker_ctf_t *lc, const char *typename)
 #ifdef DDB
 	linker_file_t lf;
 
-	TAILQ_FOREACH (lf, &linker_files, link) {
+	TAILQ_FOREACH (lf, &linker_files, link){
 		if (LINKER_CTF_LOOKUP_TYPENAME(lf, lc, typename) == 0)
 			return (0);
 	}
@@ -828,7 +828,7 @@ linker_ctf_lookup_sym_ddb(const char *symname, c_linker_sym_t *sym,
 #ifdef DDB
 	linker_file_t lf;
 
-	TAILQ_FOREACH (lf, &linker_files, link) {
+	TAILQ_FOREACH (lf, &linker_files, link){
 		if (LINKER_LOOKUP_DEBUG_SYMBOL_CTF(lf, symname, sym, lc) == 0)
 			return (0);
 	}

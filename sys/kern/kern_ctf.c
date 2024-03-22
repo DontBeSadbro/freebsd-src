@@ -301,8 +301,10 @@ link_elf_ctf_get_ddb(linker_file_t lf, linker_ctf_t *lc)
 {
 	elf_file_t ef = (elf_file_t)lf;
 
-	/* Check whether CTF data was loaded or if a previous loading attempt
-	 * failed (ctfcnt == -1). */
+	/* 
+	 * Check whether CTF data was loaded or if a
+	 * previous loading attempt failed (ctfcnt == -1).
+	 */
 	if (ef->ctfcnt <= 0) {
 		return (ENOENT);
 	}
