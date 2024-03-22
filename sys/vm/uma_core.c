@@ -5405,6 +5405,68 @@ uma_avail(void)
 	return (uma_kmem_limit - uma_size());
 }
 
+struct uma_reserv_import_chunk {
+	uint16_t popcnt;
+	vm_page_t pages;
+	bitstr_t	bit_decl(popmap, VM_LEVEL_0_NPAGES_MAX);
+	struct mtx lock;
+	TAILQ_ENTRY(uma_reserv_import_chunk) link;
+};
+
+struct uma_reserv_import_queue {
+	struct mtx lock;
+	TAILQ_HEAD(chunkq, uma_reserv_import_chunk);
+};
+
+struct uma_reserv_import_ctx {
+	struct uma_reserv_import_queue fullq;
+	struct uma_reserv_import_queue partialq;
+	struct uma_reserv_import_queue emptyq;
+};
+
+struct uma_reserv_import_ctx *
+uma_reserv_import_next_chunk(struct uma_reserv_import_ctx *ctx)
+{
+	struct uma_reserv_import_chunk *ret;
+
+	/* Try to grab a partially full chunk. */
+	ret = TAILQ_FIRST(&ctx->partial_chunks);
+	if (ret != NULL)
+		goto found;
+	ret = TAILQ_FIRST(&ctx->empty_chunks);
+	if (ret != NULL)
+		goto found;
+	ret = malloc(sizeof(*ret), M_TEMP, M_ZERO | M_NOWAIT);
+	if (ret == NULL)
+				return (NULL);
+
+found:
+	return ret;
+}
+
+int
+uma_reserv_import(void *arg, void **store, int count, int domain,
+         int flags)
+{
+	int i;
+	struct uma_reserv_import_chunk *curchunk;
+	struct uma_reserv_import_ctx *ctx = (struct uma_reserv_import_ctx *)arg;
+
+	curchunk = uma_reserv_import_next_chunk(ctx);
+	for (i = 0; i < count; i++) {
+		if (curchunk->popcnt >= VM_LEVEL_0_NPAGES_MAX) {
+			// fetch new chunk
+		}
+	}
+}
+
+void
+uma_reserv_release(void *arg, void **store, int count)
+{
+	struct uma_reserv_import_ctx *ctx = (struct uma_reserv_import_ctx *)arg;
+
+}
+
 #ifdef DDB
 /*
  * Generate statistics across both the zone and its per-cpu cache's.  Return
